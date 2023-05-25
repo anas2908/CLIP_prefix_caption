@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch.nn import functional as nnf
 from torch.utils.data import Dataset, DataLoader
 from enum import Enum
-from transformers import GPT2Tokenizer, GPT2LMHeadModel, AdamW, get_linear_schedule_with_warmup
+from transformers import T5Tokenizer, T5ForConditionalGeneration, AdamW, get_linear_schedule_with_warmup
 from tqdm import tqdm
 import os
 import pickle
@@ -46,9 +46,9 @@ class ClipCocoDataset(Dataset):
             prefix = prefix / prefix.norm(2, -1)
         return tokens, mask, prefix
 
-    def __init__(self, data_path: str,  prefix_length: int, gpt2_type: str = "gpt2",
+    def __init__(self, data_path: str,  prefix_length: int, T5_type: str = "T5",
                  normalize_prefix=False):
-        self.tokenizer = GPT2Tokenizer.from_pretrained(gpt2_type)
+        self.tokenizer = T5Tokenizer.from_pretrained(T5_type)
         self.prefix_length = prefix_length
         self.normalize_prefix = normalize_prefix
         with open(data_path, 'rb') as f:
@@ -224,26 +224,26 @@ class ClipCaptionModel(nn.Module):
 
     def forward(self, tokens: torch.Tensor, prefix: torch.Tensor, mask: Optional[torch.Tensor] = None,
                 labels: Optional[torch.Tensor] = None):
-        embedding_text = self.gpt.transformer.wte(tokens)
-        prefix_projections = self.clip_project(prefix).view(-1, self.prefix_length, self.gpt_embedding_size)
+        embedding_text =self.t5_model.encoder.embed_tokens(tokens)
+        prefix_projections = self.clip_project(prefix).view(-1, self.prefix_length, self.t5_embedding_size)
         embedding_cat = torch.cat((prefix_projections, embedding_text), dim=1)
         if labels is not None:
             dummy_token = self.get_dummy_token(tokens.shape[0], tokens.device)
             labels = torch.cat((dummy_token, tokens), dim=1)
-        out = self.gpt(inputs_embeds=embedding_cat, labels=labels, attention_mask=mask)
+        out = self.t5_model(inputs_embeds=embedding_cat, labels=labels, attention_mask=mask)
         return out
 
     def __init__(self, prefix_length: int, clip_length: Optional[int] = None, prefix_size: int = 512,
                  num_layers: int = 8, mapping_type: MappingType = MappingType.MLP):
         super(ClipCaptionModel, self).__init__()
         self.prefix_length = prefix_length
-        self.gpt = GPT2LMHeadModel.from_pretrained('gpt2')
-        self.gpt_embedding_size = self.gpt.transformer.wte.weight.shape[1]
+        self.t5_model = T5ForConditionalGeneration.from_pretrained('t5-small')
+        self.t5_embedding_size = self.t5_model.encoder.embed_tokens.weight.shape[1]
         if mapping_type == MappingType.MLP:
-            self.clip_project = MLP((prefix_size, (self.gpt_embedding_size * prefix_length) // 2,
-                                     self.gpt_embedding_size * prefix_length))
+            self.clip_project = MLP((prefix_size, (self.t5_embedding_size * prefix_length) // 2,
+                                     self.t5_embedding_size * prefix_length))
         else:
-            self.clip_project = TransformerMapper(prefix_size, self.gpt_embedding_size, prefix_length,
+            self.clip_project = TransformerMapper(prefix_size, self.t5_embedding_size, prefix_length,
                                                                      clip_length, num_layers)
 
 
@@ -254,7 +254,7 @@ class ClipCaptionPrefix(ClipCaptionModel):
 
     def train(self, mode: bool = True):
         super(ClipCaptionPrefix, self).train(mode)
-        self.gpt.eval()
+        self.t5_model.eval()
         return self
 
 
@@ -361,7 +361,7 @@ def main():
     else:
         model = ClipCaptionModel(prefix_length, clip_length=args.prefix_length_clip, prefix_size=prefix_dim,
                                   num_layers=args.num_layers, mapping_type=args.mapping_type)
-        print("Train both prefix and GPT")
+        print("Train both prefix and T5")
         sys.stdout.flush()
     train(dataset, model, args, output_dir=args.out_dir, output_prefix=args.prefix)
 
