@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch.nn import functional as nnf
 from torch.utils.data import Dataset, DataLoader
 from enum import Enum
-from transformers import T5Tokenizer, T5ForConditionalGeneration, AdamW, get_linear_schedule_with_warmup
+from transformers import T5Tokenizer, T5ForConditionalGeneration, AdamW, get_linear_schedule_with_warmup,T5Tokenizer
 from tqdm import tqdm
 import os
 import pickle
