@@ -46,7 +46,7 @@ class ClipCocoDataset(Dataset):
             prefix = prefix / prefix.norm(2, -1)
         return tokens, mask, prefix
 
-    def __init__(self, data_path: str,  prefix_length: int, T5_type: str = "T5",
+    def __init__(self, data_path: str,  prefix_length: int, T5_type: str = "t5-small",
                  normalize_prefix=False):
         self.tokenizer = T5Tokenizer.from_pretrained(T5_type)
         self.prefix_length = prefix_length
