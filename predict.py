@@ -10,8 +10,8 @@ import torch.nn.functional as nnf
 import sys
 from typing import Tuple, List, Union, Optional
 from transformers import (
-    GPT2Tokenizer,
-    GPT2LMHeadModel,
+    T5Tokenizer,
+    T5Model,
     AdamW,
     get_linear_schedule_with_warmup,
 )
@@ -52,7 +52,7 @@ class Predictor(cog.Predictor):
         self.clip_model, self.preprocess = clip.load(
             "ViT-B/32", device=self.device, jit=False
         )
-        self.tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+        self.tokenizer = T5Tokenizer.from_pretrained("t5-small")
 
         self.models = {}
         self.prefix_length = 10
@@ -119,7 +119,7 @@ class ClipCaptionModel(nn.Module):
     def forward(
         self, tokens: T, prefix: T, mask: Optional[T] = None, labels: Optional[T] = None
     ):
-        embedding_text = self.gpt.transformer.wte(tokens)
+        embedding_text = self.t5_model.encoder.embed_tokens(tokens)
         prefix_projections = self.clip_project(prefix).view(
             -1, self.prefix_length, self.gpt_embedding_size
         )
@@ -129,26 +129,18 @@ class ClipCaptionModel(nn.Module):
         if labels is not None:
             dummy_token = self.get_dummy_token(tokens.shape[0], tokens.device)
             labels = torch.cat((dummy_token, tokens), dim=1)
-        out = self.gpt(inputs_embeds=embedding_cat, labels=labels, attention_mask=mask)
+        out = self.t5_model(inputs_embeds=embedding_cat, labels=labels, attention_mask=mask)
         return out
 
     def __init__(self, prefix_length: int, prefix_size: int = 512):
         super(ClipCaptionModel, self).__init__()
         self.prefix_length = prefix_length
-        self.gpt = GPT2LMHeadModel.from_pretrained("gpt2")
-        self.gpt_embedding_size = self.gpt.transformer.wte.weight.shape[1]
+        self.t5_model = T5ForConditionalGeneration.from_pretrained('t5-small')
+        self.t5_embedding_size = self.t5_model.encoder.embed_tokens.weight.shape[1]
         if prefix_length > 10:  # not enough memory
-            self.clip_project = nn.Linear(
-                prefix_size, self.gpt_embedding_size * prefix_length
-            )
+            self.clip_project = nn.Linear(prefix_size, self.t5_embedding_size * prefix_length)
         else:
-            self.clip_project = MLP(
-                (
-                    prefix_size,
-                    (self.gpt_embedding_size * prefix_length) // 2,
-                    self.gpt_embedding_size * prefix_length,
-                )
-            )
+            self.clip_project = MLP((prefix_size, (self.t5_embedding_size * prefix_length) // 2,self.t5_embedding_size * prefix_length))
 
 
 class ClipCaptionPrefix(ClipCaptionModel):
@@ -157,7 +149,7 @@ class ClipCaptionPrefix(ClipCaptionModel):
 
     def train(self, mode: bool = True):
         super(ClipCaptionPrefix, self).train(mode)
-        self.gpt.eval()
+        self.t5_model.eval()
         return self
 
 
@@ -186,12 +178,20 @@ def generate_beam(
             if tokens is None:
                 tokens = torch.tensor(tokenizer.encode(prompt))
                 tokens = tokens.unsqueeze(0).to(device)
-                generated = model.gpt.transformer.wte(tokens)
+                generated = model.t5_model.encoder.embed_tokens(tokens)
         for i in range(entry_length):
-            outputs = model.gpt(inputs_embeds=generated)
-            logits = outputs.logits
-            logits = logits[:, -1, :] / (temperature if temperature > 0 else 1.0)
-            logits = logits.softmax(-1).log()
+            outputs = model.t5_model.generate(
+                generated,
+                max_length=generated.size(1) + 1,
+                num_beams=beam_size,
+                temperature=temperature,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                num_return_sequences=beam_size,
+            )
+            next_tokens = outputs[:, -1:]
+            next_token_embed = model.t5_model.encoder.embed_tokens(next_tokens)
+            next_tokens = next_tokens.squeeze(0)
             if scores is None:
                 scores, next_tokens = logits.topk(beam_size, -1)
                 generated = generated.expand(beam_size, *generated.shape[1:])
@@ -219,9 +219,7 @@ def generate_beam(
                 generated = generated[next_tokens_source]
                 scores = scores_sum_average * seq_lengths
                 is_stopped = is_stopped[next_tokens_source]
-            next_token_embed = model.gpt.transformer.wte(next_tokens.squeeze()).view(
-                generated.shape[0], 1, -1
-            )
+            next_token_embed = model.t5_model.encoder.embed_tokens(next_tokens.squeeze()).view(generated.shape[0], 1, -1)
             generated = torch.cat((generated, next_token_embed), dim=1)
             is_stopped = is_stopped + next_tokens.eq(stop_token_index).squeeze()
             if is_stopped.all():
@@ -269,28 +267,19 @@ def generate2(
                 generated = model.gpt.transformer.wte(tokens)
 
             for i in range(entry_length):
-
-                outputs = model.gpt(inputs_embeds=generated)
-                logits = outputs.logits
-                logits = logits[:, -1, :] / (temperature if temperature > 0 else 1.0)
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                cumulative_probs = torch.cumsum(
-                    nnf.softmax(sorted_logits, dim=-1), dim=-1
+              outputs = model.t5_model.generate(
+                    generated,
+                    max_length=generated.size(1) + 1,
+                    temperature=temperature,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
                 )
-                sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
-                    ..., :-1
-                ].clone()
-                sorted_indices_to_remove[..., 0] = 0
-
-                indices_to_remove = sorted_indices[sorted_indices_to_remove]
-                logits[:, indices_to_remove] = filter_value
-                next_token = torch.argmax(logits, -1).unsqueeze(0)
-                next_token_embed = model.gpt.transformer.wte(next_token)
-                if tokens is None:
-                    tokens = next_token
-                else:
-                    tokens = torch.cat((tokens, next_token), dim=1)
+              next_tokens = outputs[:, -1:]
+              next_token_embed = model.t5_model.encoder.embed_tokens(next_tokens)
+              if tokens is None:
+                tokens = next_token
+              else:
+                tokens = torch.cat((tokens, next_token), dim=1)
                 generated = torch.cat((generated, next_token_embed), dim=1)
                 if stop_token_index == next_token.item():
                     break
